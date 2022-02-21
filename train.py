@@ -7,6 +7,7 @@ from datetime import datetime
 import warnings
 from collections import defaultdict, OrderedDict
 import logging
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,7 @@ import torch.utils.data.distributed
 from utils import *
 from evaluation import *
 from network import build_model
-from dataloader import PetSegDataset
+from dataloader import PetPapulePlaqueDataset
 from loss import *
 
 parser=argparse.ArgumentParser(
@@ -31,12 +32,13 @@ parser=argparse.ArgumentParser(
 # Dataset
 parser.add_argument('root', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('--valid-root', default='', type=str)
 parser.add_argument('--img-size', default=512, type=int,
                     help='input data will be resized to img_size')
 parser.add_argument('--augmentation_prob', default=0.4, type=float,
                     help='')
 parser.add_argument('--valid-ratio', default=1/9, type=float,
+                    help='')
+parser.add_argument('--test-ratio', default=1/9, type=float,
                     help='')
 
 
@@ -67,9 +69,6 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
-
-# Validation Setting
-parser.add_argument('--iou-threshold', default=0.5, type=float)
 
 # Loss
 parser.add_argument('--loss-weight', default='[1.,1.,1.]', type=str,
@@ -139,7 +138,6 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = ",".join(map(str, range(torch.cuda.device_c
 args.loss_weight = eval(args.loss_weight)
 
 best_score = None
-best_f1_scores = defaultdict(float)
 history = defaultdict(list)
 
 create_directory(args.log_path)
@@ -283,7 +281,6 @@ def main_worker(gpu, ngpus_per_node, args):
             args.start_epoch = checkpoint['epoch']+1
             history = history['history']
             best_score = min(history['valid_loss'])
-            best_f1_scores = {k: max(v) for k, v in history.items() if 'f1' in k}
             
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -295,46 +292,41 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data Loading code
     loader = {}
-    for mode in ['train', 'valid']:
-        # dataset
-        if args.valid_root != '': # A validation dataset is already existed
-            root = args.root if mode=='train' else args.valid_root
-            valid_ratio = 0 if mode=='train' else 1
-        else: # to split train dataset into train-data and validation-data
-            root = args.root
-            valid_ratio = args.valid_ratio
-        dataset = PetSegDataset(
-            root=root, mode=mode, valid_ratio=valid_ratio, 
+    for mode in ['train', 'valid', 'test']:
+        dataset = PetPapulePlaqueDataset(
+            root=args.root, mode=mode, valid_ratio=args.valid_ratio, test_ratio=args.test_ratio,
             augmentation_prob=args.augmentation_prob, img_size=args.img_size)
         # data loader
         if mode == 'train':
+            assert len(dataset)%args.batch_size!=1, 'nn.BatchNorm2d require a size of a last batch to be more than 1.'
             train_sampler = torch.utils.data.distributed.DistributedSampler(dataset) if args.distributed else None
             loader[mode] = torch.utils.data.DataLoader(
                 dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
                 num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-        else: # valid
+        else: # valid, test
             loader[mode] = torch.utils.data.DataLoader(
                 dataset, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.workers, pin_memory=True)
-        # loggin dataset info
-        t = [dataset.info['NOR']['C'], dataset.info['ABN']['C'], dataset.info['NOR']['D'], dataset.info['ABN']['D']]
-        if not args.distributed or (args.distributed and args.rank!=0):
-            strFormat = '%-5s%-5s%-5s%-s'
-            logger.info(f"{mode} Dataset Info")
-            logger.info(strFormat % ("", "NOR", "ABN", "sum"))
-            logger.info(strFormat % ("C", t[0], t[1], t[0]+t[1]))
-            logger.info(strFormat % ("D", t[2], t[3], t[2]+t[3]))
-            logger.info(strFormat % ("sum", t[0]+t[2], t[1]+t[3], sum(t)))
-
-    # last batch size assertion
-    assert len(loader['train'].dataset)%args.batch_size!=1, 'nn.BatchNorm2d require a size of a last batch to be more than 1.'
+            
+        logger.info(f'{mode} 데이터 수 : {len(dataset)}')
+        logger.info(f'{mode} 폴리곤 수 : {dataset.info_polygon.items()}')
     
     # model save info
     create_directory(args.model_path)
-
-    model_name = f'{args.root.split("/")[-1]}_{args.backbone}_FCE_{args.epochs}_{args.lr}_{args.num_epochs_decay}_{args.lr_decay}_Adam_{args.beta1}_{args.beta2}_{args.weight_decay}'
-    model_name = model_name + '_pretrained' if args.pretrained else model_name
-    model_name = model_name + f"_{'-'.join(map(str,args.loss_weight))}"
+    model_name = ['A' if '구진' in args.root else 'C',
+                  'FCE',
+                  args.epochs,
+                  args.lr,
+                  args.num_epochs_decay,
+                  args.lr_decay,
+                  'Adam',
+                  args.beta1,
+                  args.beta2,
+                  args.weight_decay
+                 ] 
+    model_name = model_name + ['pretrained'] if args.pretrained else model_name
+    model_name.append('-'.join(map(str, args.loss_weight)))
+    model_name = '_'.join(map(str, model_name))
 
     # train
     patience = 0
@@ -344,23 +336,21 @@ def main_worker(gpu, ngpus_per_node, args):
         step_lr_schedule(optimizer, epoch, args)
 
         # train for one epoch
-        loss_sum, loss_cnt = train(loader['train'], model, criterion, optimizer, args, epoch+1)
+        train_loss_sum, train_data_cnt = train(loader['train'], model, criterion, optimizer, args, epoch+1)
 
         # evaluate on validation set
-        score_sum, score_cnt, f1_scores = validate(loader['valid'], model, criterion, args, epoch+1)
+        valid_loss_sum, valid_data_cnt = validate(loader['valid'], model, criterion, args, epoch+1)
 
         # write history
         if args.distributed:
-            epoch_result = torch.tensor([loss_sum, loss_cnt, score_sum, score_cnt],
+            result = torch.tensor([train_loss_sum, train_data_cnt, valid_loss_sum, valid_data_cnt],
                                        device=f'cuda:{args.gpu}')
-            dist.all_reduce(epoch_result, dist.ReduceOp.SUM, async_op=False)
-            loss_sum, loss_cnt, score_sum, score_cnt = temp_tensor.tolist()
+            dist.all_reduce(result, dist.ReduceOp.SUM, async_op=False)
+            train_loss_sum, train_data_cnt, valid_loss_sum, valid_data_cnt = result.tolist()
 
-        score = score_sum/score_cnt
-        history['train_loss'].append(loss_sum/loss_cnt)
+        score = valid_loss_sum/valid_data_cnt
+        history['train_loss'].append(train_loss_sum/train_data_cnt)
         history['valid_loss'].append(score)
-        for iou_threshold, score in f1_scores.items():
-            history[iou_threshold].append(score)
 
         # remember best score(loss) and save checkpoint
         is_best = True if best_score is None else score < best_score
@@ -372,21 +362,6 @@ def main_worker(gpu, ngpus_per_node, args):
                     'optimizer': optimizer.state_dict(),
                     'args': args
                 }, is_best, path=os.path.join(args.model_path, model_name), verbose=True)
-        
-        # remember best f1 score and save checkpoint
-        for k in f1_scores.keys():
-            is_best_f1 = True if epoch == 0 else f1_scores[k] > best_f1_scores[k]
-            if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank == 0):
-                save_checkpoint(best_f1_scores[k], f1_scores[k], {
-                        'epoch': epoch,
-                        'history': history,
-                        'state_dict': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'args': args
-                    }, is_best_f1, path=os.path.join(args.model_path, model_name), best_metric=k, verbose=True)
-            if is_best_f1:
-                best_f1_scores[k] = f1_scores[k]
-            
             
         # early stopping
         if is_best:
@@ -409,16 +384,14 @@ def train(train_loader, model, criterion, optimizer, args, epoch):
     # switch to train mode
     model.train()
 
-    for i, batches in enumerate(train_loader):
-        img_names = batches['img_name']
-        images = batches['input']
-        masks = batches['mask']
-        labels = batches['label']
+    for i, batch in enumerate(train_loader):
+        img_names = batch['img_name']
+        images = batch['input']
+        masks = batch['mask']
 
         if args.gpu is not None:
             images=images.cuda(args.gpu, non_blocking=True)
             masks=masks.cuda(args.gpu, non_blocking=True)
-            labels=labels.cuda(args.gpu, non_blocking=True)
 
         # backward
         SR=model(images)
@@ -446,24 +419,19 @@ def train(train_loader, model, criterion, optimizer, args, epoch):
 
 
 def validate(valid_loader, model, criterion, args, epoch):
-    losses=AverageMeter('Loss')
-    Eval={"S": SegmentationEvaluation(num_classes=args.out_ch, reduction='sum'),
-          "C": ClassificationEvaluation(num_classes=args.out_ch-1, threshold=[0.0, 0.25, 0.5])}
-    f1_scores = defaultdict(float)
+    losses = AverageMeter('Loss')
+    Eval = SegmentationEvaluation(num_classes=args.out_ch, reduction='sum')
 
     # switch to evaluate mode
     model.eval()
-
     with torch.no_grad():
         for i, batches in enumerate(valid_loader):
             img_names = batches['img_name']
             images = batches['input']
             masks = batches['mask']
-            labels = batches['label']
             if args.gpu is not None:
                 images=images.cuda(args.gpu, non_blocking=True)
                 masks=masks.cuda(args.gpu, non_blocking=True)
-                labels=labels.cuda(args.gpu, non_blocking=True)
 
             # compute output
             SR=model(images)
@@ -473,15 +441,11 @@ def validate(valid_loader, model, criterion, args, epoch):
 
             # evaluation
             one_hot_SR=make_one_hot(torch.argmax(SR, dim=1, keepdim=True), num_classes=args.out_ch).cuda(args.gpu, non_blocking=True)
-            one_hot_CR=SR2CR(SR).cuda(args.gpu, non_blocking=True)
-            one_hot_labels=make_one_hot(labels.unsqueeze(1), num_classes=args.out_ch-1).cuda(args.gpu, non_blocking=True)
-            Eval['S'](one_hot_SR, one_hot_masks)
-            Eval['C'](one_hot_CR, one_hot_labels, one_hot_SR, one_hot_masks)
+            Eval(one_hot_SR, one_hot_masks)
 
     
     # logging loss
     titleFormat = '\t%s'
-    clsFormat = '\t%-12s%-4s%-4s%-4s%-4s%-12s%-7s%-s'
     segFormat = '\t%-10s%-10s%-10s'
     i += 1
     score=torch.tensor([losses.sum, losses.count]).cuda(args.gpu)
@@ -490,32 +454,12 @@ def validate(valid_loader, model, criterion, args, epoch):
     if not args.distributed or (args.distributed and args.rank == 0):
         logger.info("Validation")
         logger.info(titleFormat % (f"valid loss: {(score[0]/score[1]).item()}"))
-    for t in Eval['C'].threshold:
-        classes=[0,1]
-        TP=torch.tensor([Eval['C'].TP[t][c] for c in classes]).cuda(args.gpu)
-        FN=torch.tensor([Eval['C'].FN[t][c] for c in classes]).cuda(args.gpu)
-        FP=torch.tensor([Eval['C'].FP[t][c] for c in classes]).cuda(args.gpu)
-        TN=torch.tensor([Eval['C'].TN[t][c] for c in classes]).cuda(args.gpu)
-        if args.distributed:
-            for mt in [TP, FN, FP, TN]:
-                dist.all_reduce(mt, dist.ReduceOp.SUM, async_op=False)
-        if not args.distributed or (args.distributed and args.rank == 0):
-            logger.info(f'\tthreshold: {t}')
-            logger.info(clsFormat % ('class id', 'TP', 'FP', 'FN', 'TN', 'precision', 'recall', 'f1_score'))
-            for i in classes:
-                PC = binary_precision(TP[i], FP[i])
-                RC = binary_recall(TP[i], FN[i])
-                F1 = binary_f1(PC, RC)
-                logger.info(clsFormat % (classes[i], int(TP[i]), int(FP[i]), int(FN[i]), int(TN[i]),
-                                         round(PC.item(), 4), round(RC.item(), 4), round(F1.item(), 4)))
-                if i == 1:
-                    f1_scores[f'f1_{t}'] = float(F1)
 
     # logging segmentation evaluation
     classes = [0, 1, 2]
-    temp_iou = torch.tensor([Eval['S'].IoU['samplewise'][c] for c in classes]).cuda(args.gpu)
-    temp_dice = torch.tensor([Eval['S'].DSC['samplewise'][c] for c in classes]).cuda(args.gpu)
-    temp_cnt=torch.tensor([Eval['S'].len[c] for c in classes]).cuda(args.gpu)
+    temp_iou = torch.tensor([Eval.IoU['samplewise'][c] for c in classes]).cuda(args.gpu)
+    temp_dice = torch.tensor([Eval.DSC['samplewise'][c] for c in classes]).cuda(args.gpu)
+    temp_cnt=torch.tensor([Eval.len[c] for c in classes]).cuda(args.gpu)
     if args.distributed:
         for mt in [temp_iou, temp_dice, temp_cnt]:
             dist.all_reduce(mt, dist.ReduceOp.SUM, async_op=False)
@@ -525,7 +469,7 @@ def validate(valid_loader, model, criterion, args, epoch):
         for i in range(len(classes)):
             logger.info(segFormat % (classes[i], round((temp_iou[i]/temp_cnt[i]).item(),4), round((temp_dice[i]/temp_cnt[i]).item(), 4)))
 
-    return losses.sum, losses.count, f1_scores
+    return losses.sum, losses.count
 
 
 def step_lr_schedule(optimizer, epoch, args):

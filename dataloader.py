@@ -2,8 +2,9 @@ import os
 import random
 import numpy as np
 import cv2
+cv2.setNumThreads(0)
 import json
-from collections import defaultdict
+from collections import defaultdict, Counter
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -15,7 +16,7 @@ from albumentations.pytorch import ToTensorV2
         
         
         
-class pet_papule_plaque_dataset(Dataset):
+class PetPapulePlaqueDataset(Dataset):
     def __init__(self, root, mode="train", valid_ratio=0.2, test_ratio=0.2, augmentation_prob=0.4, img_size=512, seed=42):
         random.seed(seed)
         # Assertion
@@ -32,9 +33,8 @@ class pet_papule_plaque_dataset(Dataset):
         self.img_size = img_size
         self.seed = seed
         
-        self.label_index = {"NOR": 1, "ABN": 2}
         self.jsons = []
-        self.classes = 3
+        self.jsons_mode = {}
         self.label_index = {'A7_무증상' : 1,
                            'A1_구진_플라크': 2}
             
@@ -48,15 +48,12 @@ class pet_papule_plaque_dataset(Dataset):
         elif mode == 'test':
             self.jsons = jsons[int(len(jsons)*(1-test_ratio)):]
         
-#         # dataset info
-#         self.info = {"NOR": {"C": 0, "D": 0},
-#                      "ABN": {"C": 0, "D": 0}}
-#         for j in self.jsons:
-#             with open(os.path.join(self.root, j), 'r') as f:
-#                 json_data = json.load(f)
-#             disease = json_data['metadata']['Disease']
-#             species = json_data['metadata']['Species']
-#             self.info[disease][species] += 1
+        # dataset info
+        self.info_polygon = Counter([])
+        for j in self.jsons:
+            with open(os.path.join(self.root, j), 'r') as f:
+                json_data = json.load(f)
+            self.info_polygon.update([anno['polygon']['label'][:2]  for anno in json_data['labelingInfo'] if 'polygon' in anno.keys()])
 
     def __len__(self):
         return len(self.jsons)
@@ -85,6 +82,7 @@ class pet_papule_plaque_dataset(Dataset):
 #         mask = torch.argmax(mask, dim=0) # categorical
 
         return {"img_name": img_name, "input": image, "mask": mask}
+#         return {"input": image, "mask": mask}
        
         
     def get_data(self, index):
@@ -113,9 +111,9 @@ class pet_papule_plaque_dataset(Dataset):
         """ get a numpy mask image. The shape is like [H, W, C] """
 
         mask = np.zeros((h, w))
-        for i, l in enumerate(labels):
+        for i, lb in enumerate(labels):
             poly = polygons[i].reshape((1,) + polygons[i].shape)
-            cv2.fillPoly(mask, poly, l, cv2.LINE_AA)
+            cv2.fillPoly(mask, poly, lb, cv2.LINE_AA)
         mask = mask.astype(np.int64)
         return mask
     
