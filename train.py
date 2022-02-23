@@ -301,7 +301,7 @@ def main_worker(gpu, ngpus_per_node, args):
             assert len(dataset)%args.batch_size!=1, 'nn.BatchNorm2d require a size of a last batch to be more than 1.'
             train_sampler = torch.utils.data.distributed.DistributedSampler(dataset) if args.distributed else None
             loader[mode] = torch.utils.data.DataLoader(
-                dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                dataset, batch_size=args.batch_size, shuffle=False,#(train_sampler is None),
                 num_workers=args.workers, pin_memory=True, sampler=train_sampler)
         else: # valid, test
             loader[mode] = torch.utils.data.DataLoader(
@@ -383,9 +383,10 @@ def train(train_loader, model, criterion, optimizer, args, epoch):
 
     # switch to train mode
     model.train()
-
     for i, batch in enumerate(train_loader):
-        img_names = batch['img_name']
+        img_name = batch['img_name']
+#         for img in img_name:
+#             print(img)
         images = batch['input']
         masks = batch['mask']
 
@@ -459,7 +460,8 @@ def validate(valid_loader, model, criterion, args, epoch):
     classes = [0, 1, 2]
     temp_iou = torch.tensor([Eval.IoU['samplewise'][c] for c in classes]).cuda(args.gpu)
     temp_dice = torch.tensor([Eval.DSC['samplewise'][c] for c in classes]).cuda(args.gpu)
-    temp_cnt=torch.tensor([Eval.len[c] for c in classes]).cuda(args.gpu)
+    Eval.len = {c: len([i for i in Eval.IoU[c] if i!=0]) for c in range(3)}
+    temp_cnt = torch.tensor([Eval.len[c] for c in classes]).cuda(args.gpu)
     if args.distributed:
         for mt in [temp_iou, temp_dice, temp_cnt]:
             dist.all_reduce(mt, dist.ReduceOp.SUM, async_op=False)
