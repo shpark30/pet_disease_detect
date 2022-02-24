@@ -71,6 +71,25 @@ class PetPapulePlaqueDataset(Dataset):
         img_name, image, labels, polygons = self.get_data(index)
         
         # Transformation
+        h, w = image.shape[:2]
+        mask = self.get_mask(labels, [np.array(poly, dtype=np.int32) for poly in polygons],
+                             h=h, w=w, img_name=img_name)
+        transformed_image, transformed_mask = self.transform(image, mask, img_name)
+        
+        # from numpy to tensor
+        Transform = ToTensorV2(transpose_mask=False)
+        image = Transform.apply(transformed_image)
+        mask = Transform.apply_to_mask(transformed_mask).type(torch.int64) # one_hot
+        
+        if img_name == '../../data/피부염/C1_감염성피부염/CYT_D_C1_002249.jpg':
+            print('transformed_image\n\t', transformed_image.shape)
+            print('transformed_mask\n\t', transformed_mask.shape, (transformed_mask==1).sum(), (transformed_mask==2).sum())
+        return {"img_name": img_name, "input": image, "mask": mask}
+
+    def __getitem__old(self, index):
+        img_name, image, labels, polygons = self.get_data(index)
+        
+        # Transformation
         num_points_per_poly = [len(poly) for poly in polygons]
         polygons_2d = np.array([point for poly in polygons for point in poly], dtype=np.int64)
         transformed_image, transformed_polygons_2d = self.transform(image, polygons_2d, img_name)
@@ -79,10 +98,6 @@ class PetPapulePlaqueDataset(Dataset):
         transformed_polygons_3d = [transformed_polygons_2d[num_points_per_poly[i-1]:num_points_per_poly[i]] \
                                    if i!=0 else transformed_polygons_2d[:num_points_per_poly[0]] \
                                    for i in range(num_polygons)]
-        if img_name == '../../data/피부염/C1_감염성피부염/CYT_D_C1_002249.jpg':
-            print('polygons_2d\n\t', polygons_2d)
-            print('transformed_polygons_2d\n\t', transformed_polygons_2d)
-            print('transformed_polygons_3d\n\t', transformed_polygons_3d)
         
         # get a mask image using transformed polygon coordinates
         h, w = transformed_image.shape[:2]
@@ -128,11 +143,6 @@ class PetPapulePlaqueDataset(Dataset):
                         y = coord_set[poly_i][f'y{coord_i+1}']
                         y = y if y < h else h-1
                         poly.append([x, y])
-                    if img_name == '../../data/피부염/C1_감염성피부염/CYT_D_C1_002249.jpg':
-                        print(img_name)
-                        print('CYT_D_C1_002249.jpg in get_data:', poly)
-                    if len(poly)==0:
-                        print('no coord in get_data:', img_name)
                     polygons.append(poly)
                 
         return img_name, image, labels, polygons
@@ -150,7 +160,7 @@ class PetPapulePlaqueDataset(Dataset):
         mask = np.array(mask).astype('int64')
         return mask
         
-    def _get_mask(self, labels, polygons, h, w):
+    def get_mask_old(self, labels, polygons, h, w):
         """ get a numpy mask image. The shape is like [H, W, C] """
         mask = np.zeros((h, w))
         # mask poly
@@ -165,7 +175,33 @@ class PetPapulePlaqueDataset(Dataset):
         mask = mask.astype(np.int64)
         return mask
     
-    def transform(self, image, polygon, img_name=''):
+    def transform(self, image, mask, img_name=''):
+        """ transform a image and  points of polygons repectively """
+        Transform = []
+        h, w = image.shape[:2]
+        aspect_ratio = h / w
+        
+        # resize
+        Transform.append(A.Resize(height=self.img_size, width=self.img_size))
+        
+        # rotate, flip, color transform
+        p = random.random()
+        if (self.mode == 'train') and (p < self.augmentation_prob):
+            Transform += [A.RandomRotate90(p=1.),
+                          A.Rotate(limit=(-10, 10), p=0.5),
+                          A.HorizontalFlip(p=0.5),
+                          A.VerticalFlip(p=0.5),
+                          A.ColorJitter(brightness=0.2,contrast=0.2,hue=0.02, p=1.)]
+        
+        # normalize, totensor
+        Transform.append(A.Normalize(mean=[0.0, 0.0, 0.0],
+                                     std=[1.0, 1.0, 1.0],
+                                     max_pixel_value=255.0))
+        Transform = A.Compose(Transform)
+        transformed = Transform(image=image, mask=mask)
+        return transformed['image'], transformed['mask']
+    
+    def transform_old(self, image, polygon, img_name=''):
         """ transform a image and  points of polygons repectively """
         Transform = []
         h, w = image.shape[:2]
@@ -205,9 +241,13 @@ class PetPapulePlaqueDataset(Dataset):
                                      max_pixel_value=255.0)]
             for i in range(len(Transform)):
                 transformed = A.Compose(Transform[:i+1], keypoint_params=A.KeypointParams(format='xy'))(image=image, keypoints=polygon)
-                print('+'.join([repr(tf).split('(')[0] for tf in Transform[:i+1]]), transformed['keypoints'])
-            
-            
+                print('+'.join([repr(tf).split('(')[0] for tf in Transform[:i+1]]), transformed['image'].shape, transformed['keypoints'], sep='/t')
+            transformed = A.Compose([A.Resize(height=self.img_size, width=self.img_size),
+                                     A.Normalize(mean=[0.0, 0.0, 0.0],
+                                                 std=[1.0, 1.0, 1.0],
+                                                 max_pixel_value=255.0)],
+                                    keypoint_params=A.KeypointParams(format='xy'))(image=image, keypoints=polygon)
+            print('Resize+Normalize', transformed['image'].shape, transformed['keypoints'], sep='\t')
         return transformed_image, transformed_polygon
         
         
