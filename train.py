@@ -23,7 +23,7 @@ import torch.utils.data.distributed
 from utils import *
 from evaluation import *
 from network import build_model
-from dataloader import PetPapulePlaqueDataset
+from dataloader import PetPapulePlaqueDataset, PetDermatitisDataset
 from loss import *
 
 parser=argparse.ArgumentParser(
@@ -293,7 +293,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data Loading code
     loader = {}
     for mode in ['train', 'valid', 'test']:
-        dataset = PetPapulePlaqueDataset(
+        dataset = PetDermatitisDataset(
             root=args.root, mode=mode, valid_ratio=args.valid_ratio, test_ratio=args.test_ratio,
             augmentation_prob=args.augmentation_prob, img_size=args.img_size)
         # data loader
@@ -301,7 +301,7 @@ def main_worker(gpu, ngpus_per_node, args):
             assert len(dataset)%args.batch_size!=1, 'nn.BatchNorm2d require a size of a last batch to be more than 1.'
             train_sampler = torch.utils.data.distributed.DistributedSampler(dataset) if args.distributed else None
             loader[mode] = torch.utils.data.DataLoader(
-                dataset, batch_size=args.batch_size, shuffle=False,#(train_sampler is None),
+                dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
                 num_workers=args.workers, pin_memory=True, sampler=train_sampler)
         else: # valid, test
             loader[mode] = torch.utils.data.DataLoader(
