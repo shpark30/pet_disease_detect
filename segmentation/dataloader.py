@@ -4,11 +4,10 @@ import numpy as np
 import cv2
 cv2.setNumThreads(0)
 from PIL import Image, ImageDraw, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 import json
 from collections import defaultdict, Counter
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
