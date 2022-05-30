@@ -1,8 +1,0 @@
-path: ../../../../data/백내장(일반)  # dataset root dir
-train: train  # train images (relative to 'path') 128 images
-val: valid  # val images (relative to 'path') 128 images
-test:  # test images (optional)
-
-# Classes
-nc: 4  # number of classes
-names: ['무', '초기', '비성숙', '성숙']  # class names
